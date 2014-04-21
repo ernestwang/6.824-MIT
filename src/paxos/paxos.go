@@ -29,18 +29,19 @@ import "sync"
 import "fmt"
 import "math/rand"
 
-
 type Paxos struct {
-  mu sync.Mutex
-  l net.Listener
-  dead bool
-  unreliable bool
-  rpcCount int
-  peers []string
-  me int // index into peers[]
+	mu         sync.Mutex
+	l          net.Listener
+	dead       bool
+	unreliable bool
+	rpcCount   int
+	peers      []string
+	me         int // index into peers[]
 
-
-  // Your data here.
+	// Your data here.
+	slots   map[int]Instance
+	maxSlot int
+	//mutex *sync.Mutex
 }
 
 //
@@ -60,25 +61,190 @@ type Paxos struct {
 // please do not change this function.
 //
 func call(srv string, name string, args interface{}, reply interface{}) bool {
-  c, err := rpc.Dial("unix", srv)
-  if err != nil {
-    err1 := err.(*net.OpError)
-    if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
-      fmt.Printf("paxos Dial() failed: %v\n", err1)
-    }
-    return false
-  }
-  defer c.Close()
-    
-  err = c.Call(name, args, reply)
-  if err == nil {
-    return true
-  }
+	c, err := rpc.Dial("unix", srv)
+	if err != nil {
+		err1 := err.(*net.OpError)
+		if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
+			fmt.Printf("paxos Dial() failed: %v\n", err1)
+		}
+		return false
+	}
+	defer c.Close()
 
-  fmt.Println(err)
-  return false
+	err = c.Call(name, args, reply)
+	if err == nil {
+		return true
+	}
+
+	fmt.Println(err)
+	return false
 }
 
+func chooseSeqNum(slotNum int, px *Paxos) int {
+	return slotNum*len(px.peers) + px.me
+}
+
+func (px *Paxos) getInstance(seq int) (bool, Instance) {
+	if instance, ok := px.slots[seq]; !ok {
+		instance = Instance{-1, -1, false, nil}
+		px.slots[seq] = instance
+	}
+	return instance.isDecided, instance
+}
+
+func (px *Paxos) propose(seq int, value interface{}) {
+	majority := len(px.peers)/2 + 1
+	agreed := false
+	for slotNum := seq; !agreed; slotNum++ {
+		seqNum := chooseSeqNum(slotNum, px)
+		//var reply_prep [len(px.peers)]*PrepareReply
+		rpcReply := make(chan *PrepareReply, len(px.peers)-1)
+		closeReply := make(chan bool)
+
+		go func() {
+			<-time.After(50 * time.Millisecond)
+			close(closeReply)
+		}()
+
+		for i, peer := range px.peers {
+			args := &PrepareArgs{seqNum, slotNum}
+			var reply PrepareReply
+			if i == px.me {
+				px.Prepare(args, &reply)
+			} else {
+				go func() {
+					ok := call(peer, "Paxos.Prepare", args, &reply)
+					select {
+					case <-closeReply:
+						rpcReply <- new(PrepareReply)
+					default:
+						if ok {
+							rpcReply <- &reply
+						}
+					}
+				}()
+			}
+
+		}
+		maxAcceptedSeqNum := -1
+		maxAcceptedValue := value
+		prep_OK := 1
+		for i := 0; i < len(px.peers)-1; i++ {
+			reply := <-rpcReply
+			if reply.isOK {
+				prep_OK++
+				if reply.AcceptedSeqNum > maxAcceptedSeqNum {
+					maxAcceptedSeqNum = reply.AcceptedSeqNum
+					maxAcceptedValue = reply.AcceptedValue
+				}
+			}
+		}
+
+		if prep_OK >= majority {
+			rpcReply = make(chan *AcceptReply, len(px.peers)-1)
+			closeReply = make(chan bool)
+
+			go func() {
+				<-time.After(50 * time.Millisecond)
+				close(closeReply)
+			}()
+
+			for i, peer := range px.peers {
+				args := &AcceptArgs{seqNum, slotNum, maxAcceptedValue}
+				var reply AcceptReply
+				if i == px.me {
+					px.Accept(args, &reply)
+				} else {
+					go func() {
+						ok := call(peer, "Paxos.Accept", args, &reply)
+						select {
+						case <-closeReply:
+							rpcReply <- new(AcceptReply)
+						default:
+							if ok {
+								rpcReply <- &reply
+							}
+						}
+					}()
+				}
+
+			} // end for accept
+			accept_OK := 1
+			for i := 0; i < len(px.peers)-1; i++ {
+				reply := <-rpcReply
+				if reply.isOK {
+					accept_OK++
+				}
+			}
+
+			if accept_OK >= majority {
+				args := &DecideArgs{seqNum, slotNum, maxAcceptedValue}
+				var reply DecideReply
+				for i, peer := range px.peers {
+					if i == px.me {
+						px.Decide(args, &reply)
+					} else {
+						go func() {
+							call(peer, "Paxos.Decide", args, &reply)
+						}()
+					}
+				}
+				agreed = true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	decided, instance := px.getInstance(args.slotNum)
+	if !decided && instance.preparedSeqNum < args.SeqNum {
+		instance.preparedSeqNum = args.SeqNum
+		//px.slots[args.SlotNum] = instance
+		//reply.AcceptedSeqNum = args.SeqNum
+		reply.AcceptedValue = instance.value
+		reply.OK = true
+	} else {
+		reply.OK = false
+	}
+	return nil
+}
+
+func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	decided, instance := px.getInstance(args.slotNum)
+	if !decided && instance.preparedSeqNum < args.SeqNum {
+		instance.preparedSeqNum = args.SeqNum
+		instance.acceptedSeqNum = args.SeqNum
+		instance.value = args.AcceptValue
+		//px.slots[args.SlotNum] = instance
+		reply.AcceptedSeqNum = args.SeqNum
+		reply.OK = true
+	} else {
+		reply.OK = false
+	}
+	return nil
+}
+
+func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
+	px.mu.Lock()
+	defer px.mu.Unlock()
+
+	decided, instance := px.getInstance(args.slotNum)
+	if !decided && instance.preparedSeqNum <= args.SeqNum {
+		instance.preparedSeqNum = args.SeqNum
+		instance.acceptedSeqNum = args.SeqNum
+		instance.value = args.AcceptValue
+		//px.slots[args.SlotNum] = instance
+
+	}
+	return nil
+}
 
 //
 // the application wants paxos to start agreement on
@@ -88,7 +254,14 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 // is reached.
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-  // Your code here.
+	// Your code here.
+	//px.mu.Lock()
+	//defer px.mu.Unlock()
+
+	decided, _ := px.getInstance(seq)
+	if !decided {
+		px.propose(seq, v)
+	}
 }
 
 //
@@ -98,7 +271,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-  // Your code here.
+	// Your code here.
 }
 
 //
@@ -107,8 +280,8 @@ func (px *Paxos) Done(seq int) {
 // this peer.
 //
 func (px *Paxos) Max() int {
-  // Your code here.
-  return 0
+	// Your code here.
+	return 0
 }
 
 //
@@ -138,10 +311,10 @@ func (px *Paxos) Max() int {
 // life, it will need to catch up on instances that it
 // missed -- the other peers therefor cannot forget these
 // instances.
-// 
+//
 func (px *Paxos) Min() int {
-  // You code here.
-  return 0
+	// You code here.
+	return 0
 }
 
 //
@@ -152,10 +325,9 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
-  // Your code here.
-  return false, nil
+	// Your code here.
+	return false, nil
 }
-
 
 //
 // tell the peer to shut itself down.
@@ -163,10 +335,10 @@ func (px *Paxos) Status(seq int) (bool, interface{}) {
 // please do not change this function.
 //
 func (px *Paxos) Kill() {
-  px.dead = true
-  if px.l != nil {
-    px.l.Close()
-  }
+	px.dead = true
+	if px.l != nil {
+		px.l.Close()
+	}
 }
 
 //
@@ -175,64 +347,64 @@ func (px *Paxos) Kill() {
 // are in peers[]. this servers port is peers[me].
 //
 func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
-  px := &Paxos{}
-  px.peers = peers
-  px.me = me
+	px := &Paxos{}
+	px.peers = peers
+	px.me = me
 
+	// Your initialization code here.
+	px.slots = make(map[int]Instance)
+	// My initialization
 
-  // Your initialization code here.
+	if rpcs != nil {
+		// caller will create socket &c
+		rpcs.Register(px)
+	} else {
+		rpcs = rpc.NewServer()
+		rpcs.Register(px)
 
-  if rpcs != nil {
-    // caller will create socket &c
-    rpcs.Register(px)
-  } else {
-    rpcs = rpc.NewServer()
-    rpcs.Register(px)
+		// prepare to receive connections from clients.
+		// change "unix" to "tcp" to use over a network.
+		os.Remove(peers[me]) // only needed for "unix"
+		l, e := net.Listen("unix", peers[me])
+		if e != nil {
+			log.Fatal("listen error: ", e)
+		}
+		px.l = l
 
-    // prepare to receive connections from clients.
-    // change "unix" to "tcp" to use over a network.
-    os.Remove(peers[me]) // only needed for "unix"
-    l, e := net.Listen("unix", peers[me]);
-    if e != nil {
-      log.Fatal("listen error: ", e);
-    }
-    px.l = l
-    
-    // please do not change any of the following code,
-    // or do anything to subvert it.
-    
-    // create a thread to accept RPC connections
-    go func() {
-      for px.dead == false {
-        conn, err := px.l.Accept()
-        if err == nil && px.dead == false {
-          if px.unreliable && (rand.Int63() % 1000) < 100 {
-            // discard the request.
-            conn.Close()
-          } else if px.unreliable && (rand.Int63() % 1000) < 200 {
-            // process the request but force discard of reply.
-            c1 := conn.(*net.UnixConn)
-            f, _ := c1.File()
-            err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
-            if err != nil {
-              fmt.Printf("shutdown: %v\n", err)
-            }
-            px.rpcCount++
-            go rpcs.ServeConn(conn)
-          } else {
-            px.rpcCount++
-            go rpcs.ServeConn(conn)
-          }
-        } else if err == nil {
-          conn.Close()
-        }
-        if err != nil && px.dead == false {
-          fmt.Printf("Paxos(%v) accept: %v\n", me, err.Error())
-        }
-      }
-    }()
-  }
+		// please do not change any of the following code,
+		// or do anything to subvert it.
 
+		// create a thread to accept RPC connections
+		go func() {
+			for px.dead == false {
+				conn, err := px.l.Accept()
+				if err == nil && px.dead == false {
+					if px.unreliable && (rand.Int63()%1000) < 100 {
+						// discard the request.
+						conn.Close()
+					} else if px.unreliable && (rand.Int63()%1000) < 200 {
+						// process the request but force discard of reply.
+						c1 := conn.(*net.UnixConn)
+						f, _ := c1.File()
+						err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
+						if err != nil {
+							fmt.Printf("shutdown: %v\n", err)
+						}
+						px.rpcCount++
+						go rpcs.ServeConn(conn)
+					} else {
+						px.rpcCount++
+						go rpcs.ServeConn(conn)
+					}
+				} else if err == nil {
+					conn.Close()
+				}
+				if err != nil && px.dead == false {
+					fmt.Printf("Paxos(%v) accept: %v\n", me, err.Error())
+				}
+			}
+		}()
+	}
 
-  return px
+	return px
 }
