@@ -28,6 +28,9 @@ import "syscall"
 import "sync"
 import "fmt"
 import "math/rand"
+import "time"
+import "io/ioutil"
+import "container/list"
 
 type Paxos struct {
 	mu         sync.Mutex
@@ -43,6 +46,13 @@ type Paxos struct {
 	maxSlot int
 	//mutex *sync.Mutex
 }
+
+var (
+	LOGE = log.New(ioutil.Discard, "ERROR ", log.Lmicroseconds|log.Lshortfile)
+	//LOGV = log.New(ioutil.Discard, "VERBOSE ", log.Lmicroseconds|log.Lshortfile)
+	LOGV = log.New(os.Stdout, "VERBOSE ", log.Lmicroseconds|log.Lshortfile)
+	LOGW = log.New(os.Stdout, "VERBOSE ", log.Lmicroseconds|log.Lshortfile)
+)
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -85,7 +95,10 @@ func chooseSeqNum(slotNum int, px *Paxos) int {
 }
 
 func (px *Paxos) getInstance(seq int) (bool, Instance) {
-	if instance, ok := px.slots[seq]; !ok {
+	//px.mu.Lock()
+	//defer px.mu.Unlock()
+	instance, ok := px.slots[seq]
+	if !ok {
 		instance = Instance{-1, -1, false, nil}
 		px.slots[seq] = instance
 	}
@@ -93,56 +106,90 @@ func (px *Paxos) getInstance(seq int) (bool, Instance) {
 }
 
 func (px *Paxos) propose(seq int, value interface{}) {
+	LOGV.Printf("Propose: slot=%d\n", seq)
 	majority := len(px.peers)/2 + 1
 	agreed := false
 	for slotNum := seq; !agreed; slotNum++ {
 		seqNum := chooseSeqNum(slotNum, px)
 		//var reply_prep [len(px.peers)]*PrepareReply
-		rpcReply := make(chan *PrepareReply, len(px.peers)-1)
-		closeReply := make(chan bool)
-
-		go func() {
-			<-time.After(50 * time.Millisecond)
-			close(closeReply)
-		}()
-
+		//rpcReply := make(chan *PrepareReply, len(px.peers)-1)
+		//closeReply := make(chan bool)
+		/*
+			go func() {
+				<-time.After(50 * time.Millisecond)
+				close(closeReply)
+			}()
+		*/
+		replies := list.New()
 		for i, peer := range px.peers {
+			LOGV.Printf("prepare peer %d, %s\n", i, peer)
+
+			//go func(peer string) {
+			//LOGV.Printf("prepare peer %s\n", peer)
 			args := &PrepareArgs{seqNum, slotNum}
 			var reply PrepareReply
+			ok := false
 			if i == px.me {
 				px.Prepare(args, &reply)
+				ok = true
 			} else {
-				go func() {
-					ok := call(peer, "Paxos.Prepare", args, &reply)
-					select {
-					case <-closeReply:
-						rpcReply <- new(PrepareReply)
-					default:
-						if ok {
-							rpcReply <- &reply
-						}
-					}
-				}()
+				ok = call(peer, "Paxos.Prepare", args, &reply)
+
 			}
+			if ok {
+				replies.PushBack(reply)
+			}
+			/*
+				select {
+				case <-closeReply:
+					rpcReply <- new(PrepareReply)
+				default:
+					if ok {
+						rpcReply <- &reply
+					}
+				}
+			*/
+			//}(peer)
 
 		}
-		maxAcceptedSeqNum := -1
+		maxAcceptedSeqNum := seqNum
 		maxAcceptedValue := value
-		prep_OK := 1
-		for i := 0; i < len(px.peers)-1; i++ {
-			reply := <-rpcReply
-			if reply.isOK {
+		prep_OK := 0
+		for e := replies.Front(); e != nil; e = e.Next() {
+			reply := e.Value.(PrepareReply)
+			LOGV.Printf("reply to prepare: reply=%s\n", reply)
+			if reply.OK {
 				prep_OK++
 				if reply.AcceptedSeqNum > maxAcceptedSeqNum {
+					//LOGV.Printf("n_a=%d>n=%d, max_value=%s\n", reply.AcceptedSeqNum, maxAcceptedSeqNum, reply.AcceptedValue)
+
 					maxAcceptedSeqNum = reply.AcceptedSeqNum
 					maxAcceptedValue = reply.AcceptedValue
 				}
 			}
 		}
+		//LOGV.Printf("max_value=%s\n", maxAcceptedValue)
+		/*
+			for i := 0; i < len(px.peers)-1; i++ {
+				LOGV.Printf("reply from peer %d\n", i)
+				reply := <-rpcReply
+				if reply.OK {
+					prep_OK++
+					if reply.AcceptedSeqNum > maxAcceptedSeqNum {
+						//LOGV.Printf("n_a=%d>n=%d, max_value=%s\n", reply.AcceptedSeqNum, maxAcceptedSeqNum, reply.AcceptedValue)
+
+						maxAcceptedSeqNum = reply.AcceptedSeqNum
+						maxAcceptedValue = reply.AcceptedValue
+					}
+				}
+			}
+		*/
+		LOGV.Printf("prepare : ok=%d\n", prep_OK)
 
 		if prep_OK >= majority {
-			rpcReply = make(chan *AcceptReply, len(px.peers)-1)
-			closeReply = make(chan bool)
+			LOGV.Printf("prepare reach quorum: ok=%d\n", prep_OK)
+			rpcReply := make(chan *AcceptReply, len(px.peers)-1)
+			closeReply := make(chan bool)
 
 			go func() {
 				<-time.After(50 * time.Millisecond)
@@ -155,7 +202,7 @@ func (px *Paxos) propose(seq int, value interface{}) {
 				if i == px.me {
 					px.Accept(args, &reply)
 				} else {
-					go func() {
+					go func(peer string) {
 						ok := call(peer, "Paxos.Accept", args, &reply)
 						select {
 						case <-closeReply:
@@ -165,28 +212,29 @@ func (px *Paxos) propose(seq int, value interface{}) {
 								rpcReply <- &reply
 							}
 						}
-					}()
+					}(peer)
 				}
 
 			} // end for accept
 			accept_OK := 1
 			for i := 0; i < len(px.peers)-1; i++ {
 				reply := <-rpcReply
-				if reply.isOK {
+				if reply.OK {
 					accept_OK++
 				}
 			}
 
 			if accept_OK >= majority {
+				LOGV.Printf("accept reach quorum: ok=%d\n", accept_OK)
 				args := &DecideArgs{seqNum, slotNum, maxAcceptedValue}
 				var reply DecideReply
 				for i, peer := range px.peers {
 					if i == px.me {
 						px.Decide(args, &reply)
 					} else {
-						go func() {
+						go func(peer string) {
 							call(peer, "Paxos.Decide", args, &reply)
-						}()
+						}(peer)
 					}
 				}
 				agreed = true
@@ -199,30 +247,33 @@ func (px *Paxos) propose(seq int, value interface{}) {
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 	px.mu.Lock()
 	defer px.mu.Unlock()
-
-	decided, instance := px.getInstance(args.slotNum)
-	if !decided && instance.preparedSeqNum < args.SeqNum {
+	LOGV.Printf("Prepare: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
+	_, instance := px.getInstance(args.SlotNum)
+	if instance.preparedSeqNum < args.SeqNum {
 		instance.preparedSeqNum = args.SeqNum
-		//px.slots[args.SlotNum] = instance
-		//reply.AcceptedSeqNum = args.SeqNum
+		px.slots[args.SlotNum] = instance
+		reply.AcceptedSeqNum = instance.acceptedSeqNum
 		reply.AcceptedValue = instance.value
 		reply.OK = true
 	} else {
 		reply.OK = false
 	}
+	LOGV.Printf("Prepare return: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
+
 	return nil
 }
 
 func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 	px.mu.Lock()
 	defer px.mu.Unlock()
+	//LOGV.Printf("Accept: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
 
-	decided, instance := px.getInstance(args.slotNum)
-	if !decided && instance.preparedSeqNum < args.SeqNum {
+	_, instance := px.getInstance(args.SlotNum)
+	if instance.preparedSeqNum <= args.SeqNum {
 		instance.preparedSeqNum = args.SeqNum
 		instance.acceptedSeqNum = args.SeqNum
 		instance.value = args.AcceptValue
-		//px.slots[args.SlotNum] = instance
+		px.slots[args.SlotNum] = instance
 		reply.AcceptedSeqNum = args.SeqNum
 		reply.OK = true
 	} else {
@@ -234,13 +285,15 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
 	px.mu.Lock()
 	defer px.mu.Unlock()
+	//LOGV.Printf("Decide: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
 
-	decided, instance := px.getInstance(args.slotNum)
+	decided, instance := px.getInstance(args.SlotNum)
 	if !decided && instance.preparedSeqNum <= args.SeqNum {
 		instance.preparedSeqNum = args.SeqNum
 		instance.acceptedSeqNum = args.SeqNum
-		instance.value = args.AcceptValue
-		//px.slots[args.SlotNum] = instance
+		instance.value = args.DecidedValue
+		instance.isDecided = true
+		px.slots[args.SlotNum] = instance
 
 	}
 	return nil
@@ -257,11 +310,13 @@ func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
 	//px.mu.Lock()
 	//defer px.mu.Unlock()
-
+	LOGV.Printf("Start Paxos: peers=%d, me=%d, slot=%d\n", len(px.peers), px.me, seq)
 	decided, _ := px.getInstance(seq)
 	if !decided {
 		px.propose(seq, v)
 	}
+	//LOGV.Printf("Start Paxos returned: peers=%d, me=%d, slot=%d\n", len(px.peers), px.me, seq)
+
 }
 
 //
@@ -272,6 +327,14 @@ func (px *Paxos) Start(seq int, v interface{}) {
 //
 func (px *Paxos) Done(seq int) {
 	// Your code here.
+	/*
+		px.mu.Lock()
+		defer px.mu.Unlock()
+
+		//update my done map
+		me := px.peers[px.me]
+		px.maxPeerDones[me] = int(math.Max(float64(seq), float64(px.maxPeerDones[me])))
+	*/
 }
 
 //
@@ -281,6 +344,13 @@ func (px *Paxos) Done(seq int) {
 //
 func (px *Paxos) Max() int {
 	// Your code here.
+	/*
+		maxSeq := -1
+		for inst := range px.instances {
+			maxSeq = int(math.Max(float64(maxSeq), float64(inst)))
+		}
+		return maxSeq
+	*/
 	return 0
 }
 
@@ -314,6 +384,19 @@ func (px *Paxos) Max() int {
 //
 func (px *Paxos) Min() int {
 	// You code here.
+	/*
+		me := px.peers[px.me]
+		minSeq := px.maxPeerDones[me]
+		for _, peerMin := range px.maxPeerDones {
+			minSeq = int(math.Min(float64(minSeq), float64(peerMin)))
+		}
+		for instance := range px.instances {
+			if minSeq >= instance {
+				delete(px.instances, instance)
+			}
+		}
+		return minSeq + 1
+	*/
 	return 0
 }
 
@@ -326,7 +409,16 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
 	// Your code here.
-	return false, nil
+
+	//px.mu.Lock()
+	//defer px.mu.Unlock()
+
+	//if px.Min() <= seq {
+	decided, instance := px.getInstance(seq)
+	return decided, instance.value
+	//}
+	//return false, nil
+
 }
 
 //
