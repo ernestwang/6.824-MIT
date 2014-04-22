@@ -1,40 +1,34 @@
 package kvpaxos
 
-import "hash/fnv"
-
 const (
-  OK = "OK"
-  ErrNoKey = "ErrNoKey"
+	OK       = "OK"
+	ErrNoKey = "ErrNoKey"
+	PUT      = "PUT"
+	GET      = "GET"
 )
+
 type Err string
 
 type PutArgs struct {
-  // You'll have to add definitions here.
-  Key string
-  Value string
-  DoHash bool  // For PutHash
-  // You'll have to add definitions here.
-  // Field names must start with capital letters,
-  // otherwise RPC will break.
+	// You'll have to add definitions here.
+	Key       string
+	Value     string
+	RequestID int
+	ClientID  int
 }
 
 type PutReply struct {
-  Err Err
-  PreviousValue string   // For PutHash
+	Err Err
 }
 
 type GetArgs struct {
-  Key string
-  // You'll have to add definitions here.
+	// You'll have to add definitions here.
+	Key       string
+	RequestID int
+	ClientID  int
 }
 
 type GetReply struct {
-  Err Err
-  Value string
-}
-
-func hash(s string) uint32 {
-  h := fnv.New32a()
-  h.Write([]byte(s))
-  return h.Sum32()
+	Err   Err
+	Value string
 }

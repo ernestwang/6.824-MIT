@@ -30,7 +30,8 @@ import "fmt"
 import "math/rand"
 import "time"
 import "io/ioutil"
-import "container/list"
+
+//import "container/list"
 
 type Paxos struct {
 	mu         sync.Mutex
@@ -49,8 +50,8 @@ type Paxos struct {
 
 var (
 	LOGE = log.New(ioutil.Discard, "ERROR ", log.Lmicroseconds|log.Lshortfile)
-	//LOGV = log.New(ioutil.Discard, "VERBOSE ", log.Lmicroseconds|log.Lshortfile)
-	LOGV = log.New(os.Stdout, "VERBOSE ", log.Lmicroseconds|log.Lshortfile)
+	LOGV = log.New(ioutil.Discard, "VERBOSE ", log.Lmicroseconds|log.Lshortfile)
+	//LOGV = log.New(os.Stdout, "VERBOSE ", log.Lmicroseconds|log.Lshortfile)
 	LOGW = log.New(os.Stdout, "VERBOSE ", log.Lmicroseconds|log.Lshortfile)
 )
 
@@ -90,8 +91,8 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-func chooseSeqNum(slotNum int, px *Paxos) int {
-	return slotNum*len(px.peers) + px.me
+func chooseSeqNum(px *Paxos) int {
+	return int(time.Now().UnixNano())*len(px.peers) + px.me
 }
 
 func (px *Paxos) getInstance(seq int) (bool, Instance) {
@@ -109,55 +110,53 @@ func (px *Paxos) propose(seq int, value interface{}) {
 	LOGV.Printf("Propose: slot=%d\n", seq)
 	majority := len(px.peers)/2 + 1
 	agreed := false
-	for slotNum := seq; !agreed; slotNum++ {
-		seqNum := chooseSeqNum(slotNum, px)
+	for slotNum := seq; !agreed; {
+		seqNum := chooseSeqNum(px)
 		//var reply_prep [len(px.peers)]*PrepareReply
-		//rpcReply := make(chan *PrepareReply, len(px.peers)-1)
-		//closeReply := make(chan bool)
-		/*
-			go func() {
-				<-time.After(50 * time.Millisecond)
-				close(closeReply)
-			}()
-		*/
-		replies := list.New()
+		rpcReply := make(chan *PrepareReply, len(px.peers))
+
 		for i, peer := range px.peers {
 			LOGV.Printf("prepare peer %d, %s\n", i, peer)
 
-			//go func(peer string) {
-			//LOGV.Printf("prepare peer %s\n", peer)
-			args := &PrepareArgs{seqNum, slotNum}
-			var reply PrepareReply
-			ok := false
-			if i == px.me {
-				px.Prepare(args, &reply)
-				ok = true
-			} else {
-				ok = call(peer, "Paxos.Prepare", args, &reply)
+			go func(i int, peer string) {
+				//LOGV.Printf("prepare peer %s\n", peer)
+				args := &PrepareArgs{seqNum, slotNum}
+				var reply PrepareReply
+				replyChan := make(chan *PrepareReply)
+				go func(i int, replyChan chan *PrepareReply) {
+					ok := false
+					if i == px.me {
+						px.Prepare(args, &reply)
+						ok = true
+					} else {
+						ok = call(peer, "Paxos.Prepare", args, &reply)
 
-			}
-			if ok {
-				replies.PushBack(reply)
-			}
-			/*
-				select {
-				case <-closeReply:
-					rpcReply <- new(PrepareReply)
-				default:
-					if ok {
-						rpcReply <- &reply
 					}
+					if ok {
+						replyChan <- &reply
+					} else {
+						replyChan <- new(PrepareReply)
+					}
+
+				}(i, replyChan)
+				select {
+				case reply := <-replyChan:
+					rpcReply <- reply
+				case <-time.After(50 * time.Millisecond):
+					rpcReply <- new(PrepareReply)
 				}
-			*/
-			//}(peer)
+
+			}(i, peer)
 
 		}
-		maxAcceptedSeqNum := seqNum
+		maxAcceptedSeqNum := -1
 		maxAcceptedValue := value
 		prep_OK := 0
-		for e := replies.Front(); e != nil; e = e.Next() {
-			reply := e.Value.(PrepareReply)
-			LOGV.Printf("reply to prepare: reply=%s\n", reply)
+
+		for i := 0; i < len(px.peers); i++ {
+			reply := <-rpcReply
+			LOGV.Printf("reply from peer %d, ok=%t\n", i, reply.OK)
+
 			if reply.OK {
 				prep_OK++
 				if reply.AcceptedSeqNum > maxAcceptedSeqNum {
@@ -168,56 +167,48 @@ func (px *Paxos) propose(seq int, value interface{}) {
 				}
 			}
 		}
-		//LOGV.Printf("max_value=%s\n", maxAcceptedValue)
-		/*
-			for i := 0; i < len(px.peers)-1; i++ {
-				LOGV.Printf("reply from peer %d\n", i)
-				reply := <-rpcReply
-				if reply.OK {
-					prep_OK++
-					if reply.AcceptedSeqNum > maxAcceptedSeqNum {
-						//LOGV.Printf("n_a=%d>n=%d, max_value=%s\n", reply.AcceptedSeqNum, maxAcceptedSeqNum, reply.AcceptedValue)
 
-						maxAcceptedSeqNum = reply.AcceptedSeqNum
-						maxAcceptedValue = reply.AcceptedValue
-					}
-				}
-			}
-		*/
 		LOGV.Printf("prepare : ok=%d\n", prep_OK)
 
 		if prep_OK >= majority {
 			LOGV.Printf("prepare reach quorum: ok=%d\n", prep_OK)
-			rpcReply := make(chan *AcceptReply, len(px.peers)-1)
-			closeReply := make(chan bool)
-
-			go func() {
-				<-time.After(50 * time.Millisecond)
-				close(closeReply)
-			}()
+			rpcReply := make(chan *AcceptReply, len(px.peers))
 
 			for i, peer := range px.peers {
-				args := &AcceptArgs{seqNum, slotNum, maxAcceptedValue}
-				var reply AcceptReply
-				if i == px.me {
-					px.Accept(args, &reply)
-				} else {
-					go func(peer string) {
-						ok := call(peer, "Paxos.Accept", args, &reply)
-						select {
-						case <-closeReply:
-							rpcReply <- new(AcceptReply)
-						default:
-							if ok {
-								rpcReply <- &reply
-							}
-						}
-					}(peer)
-				}
+				go func(i int, peer string) {
+					//LOGV.Printf("prepare peer %s\n", peer)
+					args := &AcceptArgs{seqNum, slotNum, maxAcceptedValue}
+					var reply AcceptReply
+					replyChan := make(chan *AcceptReply)
+					go func(i int, replyChan chan *AcceptReply) {
+						ok := false
+						if i == px.me {
+							px.Accept(args, &reply)
+							ok = true
+						} else {
+							ok = call(peer, "Paxos.Accept", args, &reply)
 
-			} // end for accept
-			accept_OK := 1
-			for i := 0; i < len(px.peers)-1; i++ {
+						}
+						if ok {
+							replyChan <- &reply
+						} else {
+							replyChan <- new(AcceptReply)
+						}
+
+					}(i, replyChan)
+					select {
+					case reply := <-replyChan:
+						rpcReply <- reply
+					case <-time.After(500 * time.Millisecond):
+						rpcReply <- new(AcceptReply)
+					}
+
+				}(i, peer)
+
+			}
+
+			accept_OK := 0
+			for i := 0; i < len(px.peers); i++ {
 				reply := <-rpcReply
 				if reply.OK {
 					accept_OK++
@@ -226,20 +217,26 @@ func (px *Paxos) propose(seq int, value interface{}) {
 
 			if accept_OK >= majority {
 				LOGV.Printf("accept reach quorum: ok=%d\n", accept_OK)
-				args := &DecideArgs{seqNum, slotNum, maxAcceptedValue}
-				var reply DecideReply
+
 				for i, peer := range px.peers {
+					args := &DecideArgs{seqNum, slotNum, maxAcceptedValue}
+					var reply DecideReply
+					LOGV.Printf("decide peer %d, %s\n", i, peer)
+					//go func(i int, peer string) {
 					if i == px.me {
 						px.Decide(args, &reply)
 					} else {
-						go func(peer string) {
-							call(peer, "Paxos.Decide", args, &reply)
-						}(peer)
+						call(peer, "Paxos.Decide", args, &reply)
 					}
+					//}(i, peer)
+
 				}
+
 				agreed = true
+				break
 			}
 		}
+		LOGV.Printf("agree=%t\n", agreed)
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -247,8 +244,10 @@ func (px *Paxos) propose(seq int, value interface{}) {
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 	px.mu.Lock()
 	defer px.mu.Unlock()
-	LOGV.Printf("Prepare: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
-	_, instance := px.getInstance(args.SlotNum)
+	//LOGV.Printf("Prepare: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
+
+	decided, instance := px.getInstance(args.SlotNum)
+	LOGV.Printf("Prepare: me=%d, slot=%d, decided=%t, value=%v\n", px.me, args.SlotNum, decided, instance)
 	if instance.preparedSeqNum < args.SeqNum {
 		instance.preparedSeqNum = args.SeqNum
 		px.slots[args.SlotNum] = instance
@@ -258,7 +257,7 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 	} else {
 		reply.OK = false
 	}
-	LOGV.Printf("Prepare return: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
+	//LOGV.Printf("Prepare return: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
 
 	return nil
 }
@@ -268,7 +267,9 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 	defer px.mu.Unlock()
 	//LOGV.Printf("Accept: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
 
-	_, instance := px.getInstance(args.SlotNum)
+	decided, instance := px.getInstance(args.SlotNum)
+	LOGV.Printf("Accept: me=%d, slot=%d, decided=%t, value=%v\n", px.me, args.SlotNum, decided, instance)
+
 	if instance.preparedSeqNum <= args.SeqNum {
 		instance.preparedSeqNum = args.SeqNum
 		instance.acceptedSeqNum = args.SeqNum
@@ -288,7 +289,11 @@ func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
 	//LOGV.Printf("Decide: me=%d, slot=%d, seq=%d\n", px.me, args.SlotNum, args.SeqNum)
 
 	decided, instance := px.getInstance(args.SlotNum)
-	if !decided && instance.preparedSeqNum <= args.SeqNum {
+	//LOGV.Printf("n_a=%d, n_p=%d\n", instance.acceptedSeqNum, instance.preparedSeqNum)
+	LOGV.Printf("Decide: me=%d, slot=%d, decided=%t, value=%v\n", px.me, args.SlotNum, decided, instance)
+
+	//if instance.preparedSeqNum <= args.SeqNum {
+	if !decided {
 		instance.preparedSeqNum = args.SeqNum
 		instance.acceptedSeqNum = args.SeqNum
 		instance.value = args.DecidedValue
@@ -308,14 +313,14 @@ func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
 //
 func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
-	//px.mu.Lock()
-	//defer px.mu.Unlock()
-	LOGV.Printf("Start Paxos: peers=%d, me=%d, slot=%d\n", len(px.peers), px.me, seq)
+	px.mu.Lock()
+	defer px.mu.Unlock()
+	LOGV.Printf("Start Paxos: peers=%d, me=%d, slot=%d, value=%s\n", len(px.peers), px.me, seq, v)
 	decided, _ := px.getInstance(seq)
 	if !decided {
-		px.propose(seq, v)
+		go px.propose(seq, v)
 	}
-	//LOGV.Printf("Start Paxos returned: peers=%d, me=%d, slot=%d\n", len(px.peers), px.me, seq)
+	LOGV.Printf("Start Paxos returned: peers=%d, me=%d, slot=%d\n", len(px.peers), px.me, seq)
 
 }
 
@@ -410,11 +415,12 @@ func (px *Paxos) Min() int {
 func (px *Paxos) Status(seq int) (bool, interface{}) {
 	// Your code here.
 
-	//px.mu.Lock()
-	//defer px.mu.Unlock()
+	px.mu.Lock()
+	defer px.mu.Unlock()
 
 	//if px.Min() <= seq {
 	decided, instance := px.getInstance(seq)
+	//LOGV.Printf("Status: peer %d, slot=%d, decided=%t\n", px.me, seq, decided)
 	return decided, instance.value
 	//}
 	//return false, nil

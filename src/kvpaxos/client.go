@@ -1,19 +1,21 @@
 package kvpaxos
 
 import "net/rpc"
-import "fmt"
+import "time"
+import "math/rand"
 
 type Clerk struct {
-  servers []string
-  // You will have to modify this struct.
+	servers []string
+	// You will have to modify this struct.
+	id int
 }
 
-
 func MakeClerk(servers []string) *Clerk {
-  ck := new(Clerk)
-  ck.servers = servers
-  // You'll have to add code here.
-  return ck
+	ck := new(Clerk)
+	ck.servers = servers
+	// You'll have to add code here.
+	ck.id = rand.Int()
+	return ck
 }
 
 //
@@ -33,20 +35,18 @@ func MakeClerk(servers []string) *Clerk {
 // please don't change this function.
 //
 func call(srv string, rpcname string,
-          args interface{}, reply interface{}) bool {
-  c, errx := rpc.Dial("unix", srv)
-  if errx != nil {
-    return false
-  }
-  defer c.Close()
-    
-  err := c.Call(rpcname, args, reply)
-  if err == nil {
-    return true
-  }
+	args interface{}, reply interface{}) bool {
+	c, errx := rpc.Dial("unix", srv)
+	if errx != nil {
+		return false
+	}
+	defer c.Close()
 
-  fmt.Println(err)
-  return false
+	err := c.Call(rpcname, args, reply)
+	if err == nil {
+		return true
+	}
+	return false
 }
 
 //
@@ -55,23 +55,44 @@ func call(srv string, rpcname string,
 // keeps trying forever in the face of all other errors.
 //
 func (ck *Clerk) Get(key string) string {
-  // You will have to modify this function.
-  return ""
+	args := &GetArgs{}
+	args.RequestID = rand.Int()
+	args.ClientID = ck.id
+	args.Key = key
+
+	for {
+		// try each known server.
+		for _, srv := range ck.servers {
+			var reply GetReply
+			ok := call(srv, "KVPaxos.Get", args, &reply)
+			if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+				return reply.Value
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return ""
 }
 
 //
 // set the value for a key.
 // keeps trying until it succeeds.
 //
-func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
-  // You will have to modify this function.
-  return ""
-}
-
 func (ck *Clerk) Put(key string, value string) {
-  ck.PutExt(key, value, false)
-}
-func (ck *Clerk) PutHash(key string, value string) string {
-  v := ck.PutExt(key, value, true)
-  return v
+	args := &PutArgs{}
+	args.RequestID = rand.Int()
+	args.ClientID = ck.id
+	args.Key = key
+	args.Value = value
+
+	for {
+		for _, srv := range ck.servers {
+			var reply PutReply
+			ok := call(srv, "KVPaxos.Put", args, &reply)
+			if ok && reply.Err == OK {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }

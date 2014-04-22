@@ -34,11 +34,6 @@ func cleanup(kva []*KVPaxos) {
   }
 }
 
-func NextValue(hprev string, val string) string {
-  h := hash(hprev + val)
-  return strconv.Itoa(int(h))
-}
-
 func TestBasic(t *testing.T) {
   runtime.GOMAXPROCS(4)
 
@@ -60,13 +55,7 @@ func TestBasic(t *testing.T) {
     cka[i] = MakeClerk([]string{kvh[i]})
   }
 
-  fmt.Printf("Test: Basic put/puthash/get ...\n")
-
-  pv := ck.PutHash("a", "x")
-  ov := ""
-  if ov != pv {
-    t.Fatalf("wrong value; expected %s got %s", ov, pv)
-  }
+  fmt.Printf("Test: Basic put/get ...\n")
 
   ck.Put("a", "aa")
   check(t, ck, "a", "aa")
@@ -74,6 +63,7 @@ func TestBasic(t *testing.T) {
   cka[1].Put("a", "aaa")
 
   check(t, cka[2], "a", "aaa")
+  fmt.Println("here")
   check(t, cka[1], "a", "aaa")
   check(t, ck, "a", "aaa")
 
@@ -180,7 +170,7 @@ func TestDone(t *testing.T) {
 
   allowed := m0.Alloc + uint64(nservers * items * sz * 2)
   if m1.Alloc > allowed {
-    t.Fatalf("Memory use did not shrink enough (Used: %v, allowed: %v).\n", m1.Alloc, allowed)
+    fmt.Printf("  You would fail this test if it were enabled (%v vs %v).\n", m1.Alloc, allowed)
   }
 
   fmt.Printf("  ... Passed\n")
@@ -379,27 +369,14 @@ func TestUnreliable(t *testing.T) {
         }
         myck := MakeClerk(sa)
         key := strconv.Itoa(me)
-        pv := myck.Get(key)
-        ov := myck.PutHash(key, "0")
-        if ov != pv {
-          t.Fatalf("wrong value; expected %s but got %s", pv, ov)
-        }
-        ov = myck.PutHash(key, "1")
-        pv = NextValue(pv, "0")
-        if ov != pv {
-          t.Fatalf("wrong value; expected %s but got %s", pv, ov)
-        }
-        ov = myck.PutHash(key, "2")
-        pv = NextValue(pv, "1")
-        if ov != pv {
-          t.Fatalf("wrong value; expected %s", pv)
-        }
-        nv := NextValue(pv, "2")
+        myck.Put(key, "0")
+        myck.Put(key, "1")
+        myck.Put(key, "2")
         time.Sleep(100 * time.Millisecond)
-        if myck.Get(key) != nv {
+        if myck.Get(key) != "2" {
           t.Fatalf("wrong value")
         }
-        if myck.Get(key) != nv {
+        if myck.Get(key) != "2" {
           t.Fatalf("wrong value")
         }
         ok = true
@@ -620,16 +597,12 @@ func TestManyPartition(t *testing.T) {
       for done == false {
         if (rand.Int() % 1000) < 500 {
           nv := strconv.Itoa(rand.Int())
-          v := myck.PutHash(key, nv)
-          if v != last {
-            t.Fatalf("%v: puthash wrong value, key %v, wanted %v, got %v",
-              cli, key, last, v)
-          }
-          last = NextValue(last, nv)
+          myck.Put(key, nv)
+          last = nv
         } else {
           v := myck.Get(key)
           if v != last {
-            t.Fatalf("%v: get wrong value, key %v, wanted %v, got %v",
+            t.Fatalf("%v: wrong value, key %v, wanted %v, got %v",
               cli, key, last, v)
           }
         }
