@@ -29,6 +29,8 @@ type PrepareReply struct {
 	OK             bool
 	AcceptedSeqNum int
 	AcceptedValue  interface{}
+	peerdone       int
+	peerseq 	   int
 }
 
 type AcceptArgs struct {
@@ -40,6 +42,8 @@ type AcceptArgs struct {
 type AcceptReply struct {
 	AcceptedSeqNum int
 	OK             bool
+	peerdone       int
+	peerseq 	   int
 }
 
 type DecideArgs struct {
